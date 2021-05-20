@@ -133,6 +133,8 @@ func NewStreamServerInterceptor(o ...ServerOption) grpc.StreamServerInterceptor 
 		tx, ctx := startTransaction(ctx, opts.tracer, info.FullMethod)
 		defer tx.End()
 
+		wrapped := &serverStream{ServerStream: stream, ctx: ctx}
+
 		// TODO(axw) define span context schema for RPC,
 		// including at least the peer address.
 
@@ -152,7 +154,8 @@ func NewStreamServerInterceptor(o ...ServerOption) grpc.StreamServerInterceptor 
 			}
 			setTransactionResult(tx, err)
 		}()
-		return handler(srv, stream)
+
+		return handler(srv, wrapped)
 	}
 }
 
@@ -168,26 +171,26 @@ func startTransaction(ctx context.Context, tracer *apm.Tracer, name string) (*ap
 	}
 	tx := tracer.StartTransactionOptions(name, "request", opts)
 	tx.Context.SetFramework("grpc", grpc.Version)
-	if peer, ok := peer.FromContext(ctx); ok {
+	if p, ok := peer.FromContext(ctx); ok {
 		// Set underlying HTTP/2.0 request context.
 		//
 		// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
 		var tlsConnectionState *tls.ConnectionState
 		var peerAddr string
 		var authority string
-		url := url.URL{Scheme: "http", Path: name}
-		if info, ok := peer.AuthInfo.(credentials.TLSInfo); ok {
-			url.Scheme = "https"
+		u := url.URL{Scheme: "http", Path: name}
+		if info, ok := p.AuthInfo.(credentials.TLSInfo); ok {
+			u.Scheme = "https"
 			tlsConnectionState = &info.State
 		}
-		if peer.Addr != nil {
-			peerAddr = peer.Addr.String()
+		if p.Addr != nil {
+			peerAddr = p.Addr.String()
 		}
 		if values := md.Get(":authority"); len(values) > 0 {
 			authority = values[0]
 		}
 		tx.Context.SetHTTPRequest(&http.Request{
-			URL:        &url,
+			URL:        &u,
 			Method:     "POST", // method is always POST
 			ProtoMajor: 2,
 			ProtoMinor: 0,
@@ -309,4 +312,38 @@ func WithServerStreamIgnorer(s StreamIgnorerFunc) ServerOption {
 	return func(o *serverOptions) {
 		o.streamIgnorer = s
 	}
+}
+
+// serverStream wraps grpc.ServerStream to provide context for other modules.
+type serverStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *serverStream) SetHeader(md metadata.MD) error {
+	return w.ServerStream.SetHeader(md)
+}
+
+func (w *serverStream) SendHeader(md metadata.MD) error {
+	return w.ServerStream.SendHeader(md)
+}
+
+func (w *serverStream) SetTrailer(md metadata.MD) {
+	w.ServerStream.SetTrailer(md)
+}
+
+// Context if context from apm setup then return it
+func (w *serverStream) Context() context.Context {
+	if w.ctx != nil {
+		return w.ctx
+	}
+	return w.ServerStream.Context()
+}
+
+func (w *serverStream) SendMsg(m interface{}) error {
+	return w.ServerStream.SendMsg(m)
+}
+
+func (w *serverStream) RecvMsg(m interface{}) error {
+	return w.ServerStream.RecvMsg(m)
 }
